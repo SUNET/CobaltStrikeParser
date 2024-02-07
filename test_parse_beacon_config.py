@@ -85,7 +85,16 @@ class TestBeaconParsing(unittest.TestCase):
         conf = parser.parse_config()
         self.assertNotEqual(conf, None)
 
-
+    def test_custom_xor_key(self):
+        path = os.path.join(
+            os.path.dirname(__file__),
+            "samples",
+            "666febe7f932dec95990508e4d10607bd7a58c023fd1b4b874ba1a47bb348571.zip",
+        )
+        f = decrypt_sample(path)
+        parser = cobaltstrikeConfig(f)
+        conf = parser.parse_config(brute_force_xor_key=True)
+        self.assertEqual(conf.get("HttpPostUri"), "/jquery-3.3.2.min.js")
 
 if __name__ == "__main__":
     unittest.main()

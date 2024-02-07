@@ -15,6 +15,7 @@ from struct import unpack, unpack_from
 from socket import inet_ntoa
 from collections import OrderedDict
 from netstruct import unpack as netunpack
+from contextlib import closing
 import argparse
 import io
 import re
@@ -40,14 +41,14 @@ class confConsts:
     TYPE_STR = 3
 
     START_PATTERNS = {
-    3: b'\x69\x68\x69\x68\x69\x6b..\x69\x6b\x69\x68\x69\x6b..\x69\x6a',
-    4: b'\x2e\x2f\x2e\x2f\x2e...\x2e\x2c\x2e\x2f'
+        3: b'\x69\x68\x69\x68\x69\x6b..\x69\x6b\x69\x68\x69\x6b..\x69\x6a',
+        4: b'\x2e\x2f\x2e\x2f\x2e...\x2e\x2c\x2e\x2f'
     }
     START_PATTERN_DECODED = b'\x00\x01\x00\x01\x00...\x00\x02\x00\x01\x00'
     CONFIG_SIZE = 4096
     XORBYTES = {
-    3: 0x69,
-    4: 0x2e
+        3: 0x69,
+        4: 0x2e
     }
 
 class packedSetting:
@@ -368,23 +369,31 @@ class BeaconSettings:
 
 class cobaltstrikeConfig:
     def __init__(self, f):
-            '''
-            f: file path or file-like object
-            '''
-            self.data = None
-            if isinstance(f, str):
-                with open(f, 'rb') as fobj:
-                    self.data = fobj.read()
-            else:
-                self.data = f.read()
+        '''
+        f: file path or file-like object
+        '''
+        self.data = None
+        if isinstance(f, str):
+            with open(f, 'rb') as fobj:
+                self.data = fobj.read()
+        else:
+            self.data = f.read()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        del self.data
 
     """Parse the CobaltStrike configuration"""
-
     @staticmethod
-    def decode_config(cfg_blob, version):
+    def decode_config(cfg_blob, version, xor_key=None):
+        if xor_key:
+            return bytes([cfg_offset ^ xor_key for cfg_offset in cfg_blob])
+
         return bytes([cfg_offset ^ confConsts.XORBYTES[version] for cfg_offset in cfg_blob])
 
-    def _parse_config(self, version, quiet=False, as_json=False):
+    def _parse_config(self, version, quiet=False, as_json=False, xor_key=None):
         '''
         Parses beacon's configuration from beacon PE or memory dump.
         Returns json of config is found; else it returns None.
@@ -392,6 +401,7 @@ class cobaltstrikeConfig:
         :int version: Try a specific version (3 or 4), or leave None to try both of them
         :bool quiet: Whether to print missing or empty settings
         :bool as_json: Whether to dump as json
+        :int xor_key: Use a specific xor key for parsing
         '''
         re_start_match = re.search(confConsts.START_PATTERNS[version], self.data)
         re_start_decoded_match = re.search(confConsts.START_PATTERN_DECODED, self.data)
@@ -402,14 +412,25 @@ class cobaltstrikeConfig:
         decoded_config_offset = re_start_decoded_match.start() if re_start_decoded_match else -1
         
         if encoded_config_offset >= 0:
-            full_config_data = cobaltstrikeConfig.decode_config(self.data[encoded_config_offset : encoded_config_offset + confConsts.CONFIG_SIZE], version=version)
+            full_config_data = cobaltstrikeConfig.decode_config(
+                self.data[encoded_config_offset: encoded_config_offset + confConsts.CONFIG_SIZE],
+                version=version,
+                xor_key=xor_key)
         else:
             full_config_data = self.data[decoded_config_offset : decoded_config_offset + confConsts.CONFIG_SIZE]
 
         parsed_config = {}
+
+        if xor_key:
+            parsed_config['xor_key'] = hex(xor_key)
+            _cli_print("{: <{width}} - {val}".format('xor_key', width=COLUMN_WIDTH - 3, val=parsed_config['xor_key']))
+
         settings = BeaconSettings(version).settings.items()
         for conf_name, packed_conf in settings:
-            parsed_setting = packed_conf.pretty_repr(full_config_data)
+            try:
+                parsed_setting = packed_conf.pretty_repr(full_config_data)
+            except UnicodeDecodeError:
+                return None
 
             parsed_config[conf_name] = parsed_setting
             if as_json:
@@ -457,7 +478,15 @@ class cobaltstrikeConfig:
 
         return parsed_config
 
-    def parse_config(self, version=None, quiet=False, as_json=False):
+    def _parse_config_with_custom_xor_key(self, version=None, quiet=False, as_json=False):
+        for xor_key in range(0, 255):
+            parsed = self._parse_config(version=version, quiet=quiet, as_json=as_json, xor_key=xor_key)
+            if parsed and parsed.get('C2Server', '') != "Not Found":
+                return parsed
+
+        return None
+
+    def parse_config(self, version=None, quiet=False, as_json=False, brute_force_xor_key=False):
         '''
         Parses beacon's configuration from beacon PE or memory dump
         Returns json of config is found; else it returns None.
@@ -468,20 +497,36 @@ class cobaltstrikeConfig:
         '''
 
         if not version:
+
+            # First try with the default xor keys
             for ver in SUPPORTED_VERSIONS:
                 parsed = self._parse_config(version=ver, quiet=quiet, as_json=as_json)
-                if parsed:
+                if parsed and parsed.get('C2Server', '') != "Not Found":
                     return parsed
+
+            if brute_force_xor_key:
+                for ver in SUPPORTED_VERSIONS:
+                    parsed = self._parse_config_with_custom_xor_key(version=ver, quiet=quiet, as_json=as_json)
+                    if parsed and parsed.get('C2Server', '') != "Not Found":
+                        return parsed
+
         else:
+            if brute_force_xor_key:
+                parsed = self._parse_config_with_custom_xor_key(version=version, quiet=quiet, as_json=as_json)
+                if parsed and parsed.get('C2Server', '') != "Not Found":
+                    return parsed
+
             return self._parse_config(version=version, quiet=quiet, as_json=as_json)
         return None
 
-
-    def parse_encrypted_config_non_pe(self, version=None, quiet=False, as_json=False):
+    def parse_encrypted_config_non_pe(self, version=None, quiet=False, as_json=False, brute_force_xor_key=False):
         self.data = decrypt_beacon(self.data)
-        return self.parse_config(version=version, quiet=quiet, as_json=as_json)
+        if self.data is None:
+            return None
 
-    def parse_encrypted_config(self, version=None, quiet=False, as_json=False):
+        return self.parse_config(version=version, quiet=quiet, as_json=as_json, brute_force_xor_key=brute_force_xor_key)
+
+    def parse_encrypted_config(self, version=None, quiet=False, as_json=False, brute_force_xor_key=False):
         '''
         Parses beacon's configuration from stager dll or memory dump
         Returns json of config is found; else it returns None.
@@ -491,41 +536,44 @@ class cobaltstrikeConfig:
         '''
 
         try:
-            pe = pefile.PE(data=self.data)
+            with closing(pefile.PE(data=self.data)) as pe:
+
+                data_sections = [s for s in pe.sections if s.Name.find(b'.data') != -1]
+                if not data_sections:
+                    _cli_print("Failed to find .data section")
+                    return False
+                data = data_sections[0].get_data()
+
+                offset = 0
+                key_found = False
+                while offset < len(data):
+                    key = data[offset:offset+4]
+                    if key != bytes(4):
+                        if data.count(key) >= THRESHOLD:
+                            key_found = True
+                            size = int.from_bytes(data[offset-4:offset], 'little')
+                            encrypted_data_offset = offset+16 - (offset % 16)
+                            break
+
+                    offset += 4
+
+                if not key_found:
+                    return False
+
+                # decrypt
+                enc_data = data[encrypted_data_offset:encrypted_data_offset+size]
+                dec_data = []
+                for i,c in enumerate(enc_data):
+                    dec_data.append(c ^ key[i % 4])
+
+                dec_data = bytes(dec_data)
+                self.data = dec_data
+                return self.parse_config(version=version, quiet=quiet, as_json=as_json,
+                                         brute_force_xor_key=brute_force_xor_key)
+
         except pefile.PEFormatError:
-            return self.parse_encrypted_config_non_pe(version=version, quiet=quiet, as_json=as_json)
-
-        data_sections = [s for s in pe.sections if s.Name.find(b'.data') != -1]
-        if not data_sections:
-            _cli_print("Failed to find .data section")
-            return False
-        data = data_sections[0].get_data()
-
-        offset = 0
-        key_found = False
-        while offset < len(data):
-            key = data[offset:offset+4]
-            if key != bytes(4):
-                if data.count(key) >= THRESHOLD:
-                    key_found = True
-                    size = int.from_bytes(data[offset-4:offset], 'little')
-                    encrypted_data_offset = offset+16 - (offset % 16)
-                    break
-
-            offset += 4
-
-        if not key_found:
-            return False
-
-        # decrypt
-        enc_data = data[encrypted_data_offset:encrypted_data_offset+size]
-        dec_data = []
-        for i,c in enumerate(enc_data):
-            dec_data.append(c ^ key[i % 4])
-
-        dec_data = bytes(dec_data)
-        self.data = dec_data
-        return self.parse_config(version=version, quiet=quiet, as_json=as_json)
+            return self.parse_encrypted_config_non_pe(version=version, quiet=quiet, as_json=as_json,
+                                                      brute_force_xor_key=brute_force_xor_key)
 
 
 if __name__ == '__main__':
@@ -534,11 +582,12 @@ if __name__ == '__main__':
     parser.add_argument("--json", help="Print as json", action="store_true", default=False)
     parser.add_argument("--quiet", help="Do not print missing or empty settings", action="store_true", default=False)
     parser.add_argument("--version", help="Try as specific cobalt version (3 or 4). If not specified, tries both.", type=int)
+    parser.add_argument("--brute-force-xor-key", help="Brute force the xor key", action="store_true", default=False)
     args = parser.parse_args()
 
     if os.path.isfile(args.beacon):
-        if cobaltstrikeConfig(args.beacon).parse_config(version=args.version, quiet=args.quiet, as_json=args.json) or \
-        cobaltstrikeConfig(args.beacon).parse_encrypted_config(version=args.version, quiet=args.quiet, as_json=args.json):
+        if cobaltstrikeConfig(args.beacon).parse_config(version=args.version, quiet=args.quiet, as_json=args.json, brute_force_xor_key=args.brute_force_xor_key) or \
+           cobaltstrikeConfig(args.beacon).parse_encrypted_config(version=args.version, quiet=args.quiet, as_json=args.json, brute_force_xor_key=args.brute_force_xor_key):
             exit(0)
 
     elif args.beacon.lower().startswith('http'):
@@ -549,8 +598,8 @@ if __name__ == '__main__':
             exit(1)
 
         conf_data = x86_beacon_data or x64_beacon_data
-        if cobaltstrikeConfig(BytesIO(conf_data)).parse_config(version=args.version, quiet=args.quiet, as_json=args.json) or \
-        cobaltstrikeConfig(BytesIO(conf_data)).parse_encrypted_config(version=args.version, quiet=args.quiet, as_json=args.json):
+        if cobaltstrikeConfig(BytesIO(conf_data)).parse_config(version=args.version, quiet=args.quiet, as_json=args.json, brute_force_xor_key=args.brute_force_xor_key) or \
+           cobaltstrikeConfig(BytesIO(conf_data)).parse_encrypted_config(version=args.version, quiet=args.quiet, as_json=args.json, brute_force_xor_key=args.brute_force_xor_key):
             exit(0)
 
     else:
